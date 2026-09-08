@@ -1,5 +1,6 @@
-import { Layout as DashboardLayout } from '../../../layouts/index.js'
-import { Controller, useForm } from 'react-hook-form'
+import { Layout as DashboardLayout } from '../../../layouts/index'
+import { CippIcons } from '../../../utils/icon-registry'
+import { Controller, useForm, useFormState } from 'react-hook-form'
 import { ApiGetCall, ApiPostCall } from '../../../api/ApiCall'
 import { useRouter } from 'next/router'
 import {
@@ -25,22 +26,37 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Stack, Grid } from '@mui/system'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import {
-  ExpandMore,
-  NotificationsActive,
-  Code,
-  TableChart,
-  Visibility,
-} from '@mui/icons-material'
 import cacheTypes from '../../../data/CIPPDBCacheTypes.json'
 import { renderCustomScriptMarkdownTemplate } from '../../../utils/customScriptTemplate'
 import { useSettings } from '../../../hooks/use-settings'
-import CippFormPage from '../../../components/CippFormPages/CippFormPage'
+import CippFormPage, {
+  useCippFormPageActions,
+} from '../../../components/CippFormPages/CippFormPage'
 import CippFormComponent from '../../../components/CippComponents/CippFormComponent'
 import { CippFormCondition } from '../../../components/CippComponents/CippFormCondition'
 import { CippApiResults } from '../../../components/CippComponents/CippApiResults'
 import { CippCodeBlock } from '../../../components/CippComponents/CippCodeBlock'
 import { markdownStyles } from '../../../components/CippTestDetail/CippTestDetailOffCanvas'
+
+// Renders CippFormPage's submit inside the tester panel so it sits next to Run Test
+// instead of below the test results.
+const CustomTestSaveButton = () => {
+  const formPage = useCippFormPageActions()
+  if (!formPage) {
+    return null
+  }
+  const { submit, isSubmitting, isValid, isDirty, allowResubmit } = formPage
+  return (
+    <Button
+      variant="outlined"
+      onClick={submit}
+      type="submit"
+      disabled={isSubmitting || !isValid || (!allowResubmit && !isDirty)}
+    >
+      Save
+    </Button>
+  )
+}
 
 const Page = () => {
   const getValueType = (value) => {
@@ -133,6 +149,8 @@ const Page = () => {
     },
   })
 
+  const { isDirty } = useFormState({ control: formControl.control })
+
   const existingScript = ApiGetCall({
     url: `/api/ListCustomScripts?ScriptGuid=${ScriptGuid}`,
     queryKey: `CustomScript-${ScriptGuid}`,
@@ -206,15 +224,37 @@ const Page = () => {
       setTestResults(result)
       if (result?.Results !== undefined) {
         const generatedSchema = buildResultSchema(result.Results)
-        formControl.setValue('ResultSchema', JSON.stringify(generatedSchema, null, 2), {
-          shouldDirty: true,
-        })
+        // Compare entries only — generatedAt is a fresh timestamp on every run. Without this
+        // an unchanged re-run would dirty the form and disable Run Test until a no-op save.
+        let currentEntries = null
+        try {
+          currentEntries = JSON.parse(formControl.getValues('ResultSchema'))?.entries
+        } catch {
+          currentEntries = null
+        }
+        const schemaUnchanged =
+          !!currentEntries &&
+          JSON.stringify(currentEntries) === JSON.stringify(generatedSchema.entries)
+        if (!schemaUnchanged) {
+          formControl.setValue('ResultSchema', JSON.stringify(generatedSchema, null, 2), {
+            shouldDirty: true,
+          })
+        }
       }
     },
   })
 
+  // Run Test executes the *saved* script, so unsaved edits must be committed first.
+  const runTestDisabledReason = !isEdit
+    ? 'Save the script before running a test'
+    : isScriptLoading
+      ? 'Loading script...'
+      : isDirty
+        ? 'Save your changes before running a test'
+        : null
+
   const handleRunTest = () => {
-    if (!isEdit || !ScriptGuid) {
+    if (!isEdit || !ScriptGuid || runTestDisabledReason) {
       return
     }
 
@@ -255,7 +295,11 @@ const Page = () => {
         undefined,
         { shallow: false }
       )
+      return
     }
+    // Rebaseline the dirty state so the saved values become the new "clean" form,
+    // which is what re-enables Run Test.
+    formControl.reset(formControl.getValues(), { keepValues: true })
   }
 
   const customDataformatter = (data) => {
@@ -495,7 +539,7 @@ All UPNs: {{join(Result[*].UserPrincipalName, ", ")}}`,
 
   const hasTenantFilterParam = useMemo(() => {
     if (!watchedScriptContent) return false
-    return /-TenantFilter\b/i.test(watchedScriptContent)
+    return /-TenantFilter\b/i.test(watchedScriptContent);
   }, [watchedScriptContent])
 
   const markdownAutocompleteOptions = useMemo(() => {
@@ -678,13 +722,16 @@ All UPNs: {{join(Result[*].UserPrincipalName, ", ")}}`,
       postUrl="/api/AddCustomScript"
       customDataformatter={customDataformatter}
       onSubmitResult={handleSubmitResult}
+      // The tester panel owns Save whenever it is on screen, so results never push it
+      // to the bottom of the page. Fall back to the built-in footer button otherwise.
+      hideSubmit={testerExpanded}
     >
       <Accordion
         sx={{ mb: 2 }}
         expanded={guidanceExpanded}
         onChange={(_, expanded) => setGuidanceExpanded(expanded)}
       >
-        <AccordionSummary expandIcon={<ExpandMore />}>
+        <AccordionSummary expandIcon={<CippIcons.ExpandMore />}>
           <Typography variant="subtitle2">Test Guidance</Typography>
         </AccordionSummary>
         <AccordionDetails>
@@ -700,7 +747,12 @@ All UPNs: {{join(Result[*].UserPrincipalName, ", ")}}`,
               },
             }}
           >
-            <Typography variant="body2" color="text.secondary" sx={{ mb: 2.5 }}>
+            <Typography
+              variant="body2"
+              sx={{
+                color: "text.secondary",
+                mb: 2.5
+              }}>
               Custom tests run PowerShell against each tenant. The script output determines the
               result status.
             </Typography>
@@ -720,13 +772,16 @@ All UPNs: {{join(Result[*].UserPrincipalName, ", ")}}`,
                     <Box>
                       <Typography
                         variant="body2"
-                        fontWeight={600}
-                        color="success.main"
-                        sx={{ mb: 0.25 }}
-                      >
+                        sx={{
+                          fontWeight: 600,
+                          color: "success.main",
+                          mb: 0.25
+                        }}>
                         Pass
                       </Typography>
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                      }}>
                         Return <code>$null</code>, <code>$false</code>, empty string, or{' '}
                         <code>@()</code>
                       </Typography>
@@ -735,13 +790,16 @@ All UPNs: {{join(Result[*].UserPrincipalName, ", ")}}`,
                     <Box>
                       <Typography
                         variant="body2"
-                        fontWeight={600}
-                        color="error.main"
-                        sx={{ mb: 0.25 }}
-                      >
+                        sx={{
+                          fontWeight: 600,
+                          color: "error.main",
+                          mb: 0.25
+                        }}>
                         Fail
                       </Typography>
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: "text.secondary"
+                      }}>
                         Return any non-empty value — the returned data becomes the test output
                       </Typography>
                     </Box>
@@ -760,13 +818,16 @@ All UPNs: {{join(Result[*].UserPrincipalName, ", ")}}`,
                 >
                   <Typography
                     variant="body2"
-                    fontWeight={600}
-                    color="info.main"
-                    sx={{ mb: 0.25 }}
-                  >
+                    sx={{
+                      fontWeight: 600,
+                      color: "info.main",
+                      mb: 0.25
+                    }}>
                     Explicit Status
                   </Typography>
-                  <Typography variant="body2" color="text.secondary">
+                  <Typography variant="body2" sx={{
+                    color: "text.secondary"
+                  }}>
                     Return a hashtable with <code>CIPPStatus</code> (<code>Passed</code>/
                     <code>Failed</code>/<code>Info</code>/<code>Investigate</code>),{' '}
                     <code>CIPPResults</code>, and optional{' '}
@@ -788,13 +849,23 @@ All UPNs: {{join(Result[*].UserPrincipalName, ", ")}}`,
                     height: '100%',
                   }}
                 >
-                  <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.5 }}>
-                    <NotificationsActive sx={{ fontSize: 16 }} color="warning" />
-                    <Typography variant="body2" fontWeight={600}>
+                  <Stack
+                    direction="row"
+                    spacing={1}
+                    sx={{
+                      alignItems: "center",
+                      mb: 0.5
+                    }}>
+                    <CippIcons.NotificationsActive sx={{ fontSize: 16 }} color="warning" />
+                    <Typography variant="body2" sx={{
+                      fontWeight: 600
+                    }}>
                       Alerts
                     </Typography>
                   </Stack>
-                  <Typography variant="caption" color="text.secondary">
+                  <Typography variant="caption" sx={{
+                    color: "text.secondary"
+                  }}>
                     Enable &quot;Notify on Alert&quot; for failure alerts, deduplicated per tenant
                     per day.
                   </Typography>
@@ -810,13 +881,23 @@ All UPNs: {{join(Result[*].UserPrincipalName, ", ")}}`,
                     height: '100%',
                   }}
                 >
-                  <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.5 }}>
-                    <Code sx={{ fontSize: 16 }} color="info" />
-                    <Typography variant="body2" fontWeight={600}>
+                  <Stack
+                    direction="row"
+                    spacing={1}
+                    sx={{
+                      alignItems: "center",
+                      mb: 0.5
+                    }}>
+                    <CippIcons.Code sx={{ fontSize: 16 }} color="info" />
+                    <Typography variant="body2" sx={{
+                      fontWeight: 600
+                    }}>
                       Scripting Rules
                     </Typography>
                   </Stack>
-                  <Typography variant="caption" color="text.secondary">
+                  <Typography variant="caption" sx={{
+                    color: "text.secondary"
+                  }}>
                     Runs in PowerShell <strong>ConstrainedLanguage</strong> — approved cmdlets
                     only. <code>New-Object</code>, <code>{'[pscustomobject]@{}'}</code> casts, and
                     .NET/reflection are blocked. Build rows with{' '}
@@ -836,17 +917,27 @@ All UPNs: {{join(Result[*].UserPrincipalName, ", ")}}`,
                     height: '100%',
                   }}
                 >
-                  <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.5 }}>
-                    <TableChart sx={{ fontSize: 16 }} color="info" />
-                    <Typography variant="body2" fontWeight={600}>
+                  <Stack
+                    direction="row"
+                    spacing={1}
+                    sx={{
+                      alignItems: "center",
+                      mb: 0.5
+                    }}>
+                    <CippIcons.TableChart sx={{ fontSize: 16 }} color="info" />
+                    <Typography variant="body2" sx={{
+                      fontWeight: 600
+                    }}>
                       Data Access
                     </Typography>
                   </Stack>
                   <Typography
                     variant="caption"
-                    color="text.secondary"
-                    sx={{ display: 'block', mb: 0.5 }}
-                  >
+                    sx={{
+                      color: "text.secondary",
+                      display: 'block',
+                      mb: 0.5
+                    }}>
                     Read-only via <code>Get-CIPPTestData</code> with <code>-Type</code>.{' '}
                     Tenant is auto-locked — do not pass <code>-TenantFilter</code>. Use{' '}
                     <code>%variable%</code> syntax for replacement variables.
@@ -865,9 +956,11 @@ All UPNs: {{join(Result[*].UserPrincipalName, ", ")}}`,
 
             <Typography
               variant="caption"
-              color="text.secondary"
-              sx={{ display: 'block', mb: 2 }}
-            >
+              sx={{
+                color: "text.secondary",
+                display: 'block',
+                mb: 2
+              }}>
               Manual testing on this page is preview-only. Results are persisted only during
               scheduled tenant test runs with the script enabled.
             </Typography>
@@ -882,17 +975,21 @@ All UPNs: {{join(Result[*].UserPrincipalName, ", ")}}`,
               variant="outlined"
               sx={{ '&:before': { display: 'none' }, boxShadow: 'none' }}
             >
-              <AccordionSummary expandIcon={<ExpandMore />}>
-                <Typography variant="body2" fontWeight={600}>
+              <AccordionSummary expandIcon={<CippIcons.ExpandMore />}>
+                <Typography variant="body2" sx={{
+                  fontWeight: 600
+                }}>
                   Licensed Users with Resolved SKU Names
                 </Typography>
               </AccordionSummary>
               <AccordionDetails>
                 <Typography
                   variant="caption"
-                  color="text.secondary"
-                  sx={{ display: 'block', mb: 1 }}
-                >
+                  sx={{
+                    color: "text.secondary",
+                    display: 'block',
+                    mb: 1
+                  }}>
                   Lists all users with licenses, resolves SKU IDs to friendly names using the
                   license cache, and returns a markdown table with an explicit Passed status.
                   Demonstrates <code>CIPPStatus</code>, <code>CIPPResults</code>, and{' '}
@@ -941,17 +1038,21 @@ $md = @($header) + @($rows) -join "\\n"
               variant="outlined"
               sx={{ '&:before': { display: 'none' }, boxShadow: 'none', mt: 1 }}
             >
-              <AccordionSummary expandIcon={<ExpandMore />}>
-                <Typography variant="body2" fontWeight={600}>
+              <AccordionSummary expandIcon={<CippIcons.ExpandMore />}>
+                <Typography variant="body2" sx={{
+                  fontWeight: 600
+                }}>
                   Disabled Users with Active Licenses
                 </Typography>
               </AccordionSummary>
               <AccordionDetails>
                 <Typography
                   variant="caption"
-                  color="text.secondary"
-                  sx={{ display: 'block', mb: 1 }}
-                >
+                  sx={{
+                    color: "text.secondary",
+                    display: 'block',
+                    mb: 1
+                  }}>
                   Finds disabled accounts that still have licenses assigned — a common cost waste
                   indicator. Returns failed rows as JSON (default Result Display Type behavior). No
                   wrapper needed — non-empty output automatically means fail.
@@ -978,17 +1079,21 @@ $Users | Where-Object {
               variant="outlined"
               sx={{ '&:before': { display: 'none' }, boxShadow: 'none', mt: 1 }}
             >
-              <AccordionSummary expandIcon={<ExpandMore />}>
-                <Typography variant="body2" fontWeight={600}>
+              <AccordionSummary expandIcon={<CippIcons.ExpandMore />}>
+                <Typography variant="body2" sx={{
+                  fontWeight: 600
+                }}>
                   MFA Registration Gaps
                 </Typography>
               </AccordionSummary>
               <AccordionDetails>
                 <Typography
                   variant="caption"
-                  color="text.secondary"
-                  sx={{ display: 'block', mb: 1 }}
-                >
+                  sx={{
+                    color: "text.secondary",
+                    display: 'block',
+                    mb: 1
+                  }}>
                   Checks user registration details for accounts that haven&apos;t registered any MFA
                   method. Uses <code>Info</code> status so results are always informational rather
                   than a hard fail.
@@ -1031,17 +1136,21 @@ if ($count -gt 0) {
               variant="outlined"
               sx={{ '&:before': { display: 'none' }, boxShadow: 'none', mt: 1 }}
             >
-              <AccordionSummary expandIcon={<ExpandMore />}>
-                <Typography variant="body2" fontWeight={600}>
+              <AccordionSummary expandIcon={<CippIcons.ExpandMore />}>
+                <Typography variant="body2" sx={{
+                  fontWeight: 600
+                }}>
                   Stale Guest Accounts
                 </Typography>
               </AccordionSummary>
               <AccordionDetails>
                 <Typography
                   variant="caption"
-                  color="text.secondary"
-                  sx={{ display: 'block', mb: 1 }}
-                >
+                  sx={{
+                    color: "text.secondary",
+                    display: 'block',
+                    mb: 1
+                  }}>
                   Identifies guest accounts that haven&apos;t signed in within 90 days. Uses a{' '}
                   <code>param</code> with a default so the threshold is configurable via Test
                   Parameters. Simple auto-detection — empty result = pass, non-empty = fail.
@@ -1071,17 +1180,21 @@ $Guests | Where-Object {
               variant="outlined"
               sx={{ '&:before': { display: 'none' }, boxShadow: 'none', mt: 1 }}
             >
-              <AccordionSummary expandIcon={<ExpandMore />}>
-                <Typography variant="body2" fontWeight={600}>
+              <AccordionSummary expandIcon={<CippIcons.ExpandMore />}>
+                <Typography variant="body2" sx={{
+                  fontWeight: 600
+                }}>
                   Conditional Access Policy Summary
                 </Typography>
               </AccordionSummary>
               <AccordionDetails>
                 <Typography
                   variant="caption"
-                  color="text.secondary"
-                  sx={{ display: 'block', mb: 1 }}
-                >
+                  sx={{
+                    color: "text.secondary",
+                    display: 'block',
+                    mb: 1
+                  }}>
                   Provides an informational summary of all Conditional Access policies grouped by
                   state. Demonstrates using <code>Group-Object</code>, building a multi-section
                   markdown report, and <code>%tenantname%</code> replacement variables. Always
@@ -1136,18 +1249,28 @@ $md = $summaryTable + "\n\n---\n\n" + $policyTable
       >
         <DialogTitle>Cached Types</DialogTitle>
         <DialogContent dividers>
-          <Typography variant="caption" color="text.secondary" sx={{ mb: 2, display: 'block' }}>
+          <Typography
+            variant="caption"
+            sx={{
+              color: "text.secondary",
+              mb: 2,
+              display: 'block'
+            }}>
             Click the eye icon to explore sample data from the currently selected tenant.
           </Typography>
           <Stack spacing={1}>
             {cacheTypes.map((cacheType) => (
               <Box key={cacheType.type}>
-                <Stack direction="row" alignItems="center" spacing={1}>
+                <Stack direction="row" spacing={1} sx={{
+                  alignItems: "center"
+                }}>
                   <Box sx={{ flex: 1 }}>
                     <Typography variant="body2" sx={{ fontWeight: 600 }}>
                       {cacheType.friendlyName} ({cacheType.type})
                     </Typography>
-                    <Typography variant="caption" color="text.secondary">
+                    <Typography variant="caption" sx={{
+                      color: "text.secondary"
+                    }}>
                       {cacheType.description}
                     </Typography>
                   </Box>
@@ -1157,7 +1280,7 @@ $md = $summaryTable + "\n\n---\n\n" + $policyTable
                       onClick={() => handleExploreCache(cacheType.type)}
                       color={expandedCacheType === cacheType.type ? 'primary' : 'default'}
                     >
-                      <Visibility fontSize="small" />
+                      <CippIcons.Visibility fontSize="small" />
                     </IconButton>
                   </Tooltip>
                 </Stack>
@@ -1174,7 +1297,9 @@ $md = $summaryTable + "\n\n---\n\n" + $policyTable
                     }}
                   >
                     {cacheExplorerApi.isFetching ? (
-                      <Stack direction="row" spacing={1} alignItems="center">
+                      <Stack direction="row" spacing={1} sx={{
+                        alignItems: "center"
+                      }}>
                         <CircularProgress size={16} />
                         <Typography variant="caption">Loading sample data...</Typography>
                       </Stack>
@@ -1185,12 +1310,16 @@ $md = $summaryTable + "\n\n---\n\n" + $policyTable
                         showLineNumbers={false}
                       />
                     ) : cacheExplorerApi.isSuccess ? (
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>
                         No cached data found for this type on the selected tenant. Run a cache
                         refresh first.
                       </Typography>
                     ) : !cacheExplorerTenant ? (
-                      <Typography variant="caption" color="text.secondary">
+                      <Typography variant="caption" sx={{
+                        color: "text.secondary"
+                      }}>
                         Select a tenant to explore cached data.
                       </Typography>
                     ) : null}
@@ -1213,7 +1342,7 @@ $md = $summaryTable + "\n\n---\n\n" + $policyTable
       </Dialog>
 
       <Accordion expanded={configExpanded} onChange={(_, expanded) => setConfigExpanded(expanded)}>
-        <AccordionSummary expandIcon={<ExpandMore />}>
+        <AccordionSummary expandIcon={<CippIcons.ExpandMore />}>
           <Typography variant="subtitle2">Configuration Options</Typography>
         </AccordionSummary>
         <AccordionDetails>
@@ -1319,7 +1448,7 @@ $md = $summaryTable + "\n\n---\n\n" + $policyTable
         expanded={scriptContentExpanded}
         onChange={(_, expanded) => setScriptContentExpanded(expanded)}
       >
-        <AccordionSummary expandIcon={<ExpandMore />}>
+        <AccordionSummary expandIcon={<CippIcons.ExpandMore />}>
           <Typography variant="subtitle2">Markdown / PowerShell</Typography>
         </AccordionSummary>
         <AccordionDetails>
@@ -1347,23 +1476,29 @@ $md = $summaryTable + "\n\n---\n\n" + $policyTable
                       />
                       <Typography
                         variant="caption"
-                        color="text.secondary"
-                        sx={{ mt: 1, display: 'block' }}
-                      >
+                        sx={{
+                          color: "text.secondary",
+                          mt: 1,
+                          display: 'block'
+                        }}>
                         {markdownTemplateField.helperText}
                       </Typography>
                       <Typography
                         variant="caption"
-                        color="text.secondary"
-                        sx={{ mt: 1, display: 'block' }}
-                      >
+                        sx={{
+                          color: "text.secondary",
+                          mt: 1,
+                          display: 'block'
+                        }}>
                         Type <code>{'{{'}</code> to use schema tokens.
                       </Typography>
                       <Typography
                         variant="caption"
-                        color="text.secondary"
-                        sx={{ mt: 1, display: 'block' }}
-                      >
+                        sx={{
+                          color: "text.secondary",
+                          mt: 1,
+                          display: 'block'
+                        }}>
                         {markdownTemplateField.placeholder}
                       </Typography>
                     </>
@@ -1393,16 +1528,19 @@ $md = $summaryTable + "\n\n---\n\n" + $policyTable
                     />
                     <Typography
                       variant="caption"
-                      color="text.secondary"
-                      sx={{ mt: 1, display: 'block' }}
-                    >
+                      sx={{
+                        color: "text.secondary",
+                        mt: 1,
+                        display: 'block'
+                      }}>
                       {scriptContentField.placeholder}
                     </Typography>
                     <Typography
                       variant="caption"
-                      color="text.secondary"
-                      sx={{ display: 'block' }}
-                    >
+                      sx={{
+                        color: "text.secondary",
+                        display: 'block'
+                      }}>
                       Type <code>%</code> to insert replacement variables (e.g.{' '}
                       <code>%tenantid%</code>, <code>%defaultdomain%</code>, or custom variables).
                     </Typography>
@@ -1439,16 +1577,23 @@ $md = $summaryTable + "\n\n---\n\n" + $policyTable
         onChange={(_, expanded) => setTesterExpanded(expanded)}
         slotProps={{ transition: { unmountOnExit: true, timeout: 150 } }}
       >
-        <AccordionSummary expandIcon={<ExpandMore />}>
+        <AccordionSummary expandIcon={<CippIcons.ExpandMore />}>
           <Typography variant="subtitle2">Test Script Output</Typography>
         </AccordionSummary>
         <AccordionDetails>
           {testerExpanded &&
             (!isEdit ? (
-              <Alert severity="info">Save the script first to test execution output.</Alert>
+              <Stack spacing={2} sx={{
+                alignItems: "flex-start"
+              }}>
+                <Alert severity="info">Save the script first to test execution output.</Alert>
+                <CustomTestSaveButton />
+              </Stack>
             ) : (
               <Stack spacing={2}>
-                <Typography variant="caption" color="text.secondary">
+                <Typography variant="caption" sx={{
+                  color: "text.secondary"
+                }}>
                   Runs a preview against your current tenant and renders output using the current
                   Return Type and Markdown Template from this form.
                 </Typography>
@@ -1465,15 +1610,32 @@ $md = $summaryTable + "\n\n---\n\n" + $policyTable
   "ExcludeDisabled": true
 }`}
                 />
-                <Box>
-                  <Button
-                    variant="contained"
-                    onClick={handleRunTest}
-                    disabled={isScriptLoading || testScriptApi.isPending}
+                <Stack direction="row" spacing={2} sx={{
+                  alignItems: "center"
+                }}>
+                  <Tooltip
+                    title={runTestDisabledReason || ''}
+                    disableHoverListener={!runTestDisabledReason}
                   >
-                    Run Test
-                  </Button>
-                </Box>
+                    <span>
+                      <Button
+                        variant="contained"
+                        onClick={handleRunTest}
+                        disabled={!!runTestDisabledReason || testScriptApi.isPending}
+                      >
+                        Run Test
+                      </Button>
+                    </span>
+                  </Tooltip>
+                  <CustomTestSaveButton />
+                  {isDirty && (
+                    <Typography variant="caption" sx={{
+                      color: "text.secondary"
+                    }}>
+                      Unsaved changes — tests run the saved version of the script.
+                    </Typography>
+                  )}
+                </Stack>
 
                 {testScriptApi.isPending && (
                   <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
@@ -1487,7 +1649,9 @@ $md = $summaryTable + "\n\n---\n\n" + $policyTable
                 )}
 
                 {resultSchemaValue && (
-                  <Typography variant="caption" color="text.secondary">
+                  <Typography variant="caption" sx={{
+                    color: "text.secondary"
+                  }}>
                     Result schema detected from latest test output and used for typed markdown
                     completions above.
                   </Typography>
@@ -1495,7 +1659,13 @@ $md = $summaryTable + "\n\n---\n\n" + $policyTable
 
                 {(testResults?.Results !== undefined || testResults?.CIPPResultMarkdown) && (
                   <Box>
-                    <Stack direction="row" spacing={2} alignItems="center" sx={{ mb: 1 }}>
+                    <Stack
+                      direction="row"
+                      spacing={2}
+                      sx={{
+                        alignItems: "center",
+                        mb: 1
+                      }}>
                       <Typography variant="h6">Test Results</Typography>
                       {testResults?.CIPPStatus && (
                         <Chip
@@ -1555,7 +1725,7 @@ $md = $summaryTable + "\n\n---\n\n" + $policyTable
         </AccordionDetails>
       </Accordion>
     </CippFormPage>
-  )
+  );
 }
 
 Page.getLayout = (page) => <DashboardLayout>{page}</DashboardLayout>
