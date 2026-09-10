@@ -3,6 +3,27 @@ import axios, { isAxiosError } from "axios";
 import { useDispatch } from "react-redux";
 import { showToast } from "../store/toasts";
 import { getCippError } from "../utils/get-cipp-error";
+import { buildVersionedHeaders } from "../utils/cippVersion";
+import { impersonationCacheParams } from "../utils/impersonation";
+
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const wildcardToRegExp = (pattern) =>
+  new RegExp(`^${pattern.split("*").map(escapeRegExp).join(".*")}$`);
+const matchesWildcardPattern = (queryKey, pattern) => wildcardToRegExp(pattern).test(queryKey);
+
+// The server's Retry-After (seconds) as ms, capped so a large hint can't hang a request indefinitely.
+const getRetryAfterMs = (error) => {
+  if (!isAxiosError(error)) return null;
+  const headers = error.response?.headers;
+  const raw = headers?.get?.("retry-after") ?? headers?.["retry-after"];
+  const seconds = Number(raw);
+  return Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds * 1000, 60000) : null;
+};
+
+// react-query's default exponential backoff, but honouring the server's Retry-After when present so a
+// throttled retry lands after the limit clears instead of hammering inside the window.
+const retryDelayWithRetryAfter = (failureCount, error) =>
+  getRetryAfterMs(error) ?? Math.min(1000 * 2 ** failureCount, 30000);
 
 export function ApiGetCall(props) {
   const {
@@ -49,7 +70,7 @@ export function ApiGetCall(props) {
           title: `${
             error.config?.params?.tenantFilter ? error.config?.params?.tenantFilter : ""
           } Error`,
-        })
+        }),
       );
     }
     return returnRetry;
@@ -65,10 +86,9 @@ export function ApiGetCall(props) {
           const element = data[i];
           const response = await axios.get(url, {
             signal: signal,
-            params: element,
-            headers: {
-              "Content-Type": "application/json",
-            },
+            params: { ...element, ...impersonationCacheParams() },
+            headers: await buildVersionedHeaders(),
+            cippQueryKey: queryKey,
           });
           results.push(response.data);
           if (onResult) {
@@ -79,10 +99,8 @@ export function ApiGetCall(props) {
           const clearKeys = Array.isArray(relatedQueryKeys) ? relatedQueryKeys : [relatedQueryKeys];
           setTimeout(() => {
             // Separate wildcard patterns from exact keys
-            const wildcardPatterns = clearKeys
-              .filter((key) => key.endsWith("*"))
-              .map((key) => key.slice(0, -1));
-            const exactKeys = clearKeys.filter((key) => !key.endsWith("*"));
+            const wildcardPatterns = clearKeys.filter((key) => key.includes("*"));
+            const exactKeys = clearKeys.filter((key) => !key.includes("*"));
 
             // Use single predicate call for all wildcard patterns
             if (wildcardPatterns.length > 0) {
@@ -90,7 +108,9 @@ export function ApiGetCall(props) {
                 predicate: (query) => {
                   if (!query.queryKey || !query.queryKey[0]) return false;
                   const queryKeyStr = String(query.queryKey[0]);
-                  return wildcardPatterns.some((pattern) => queryKeyStr.startsWith(pattern));
+                  return wildcardPatterns.some((pattern) =>
+                    matchesWildcardPattern(queryKeyStr, pattern),
+                  );
                 },
               });
             }
@@ -105,11 +125,10 @@ export function ApiGetCall(props) {
       } else {
         const response = await axios.get(url, {
           signal: url === "/api/tenantFilter" ? null : signal,
-          params: data,
-          headers: {
-            "Content-Type": "application/json",
-          },
+          params: { ...data, ...impersonationCacheParams() },
+          headers: await buildVersionedHeaders(),
           responseType: responseType,
+          cippQueryKey: queryKey,
         });
 
         let responseData = response.data;
@@ -130,10 +149,8 @@ export function ApiGetCall(props) {
           const clearKeys = Array.isArray(relatedQueryKeys) ? relatedQueryKeys : [relatedQueryKeys];
           setTimeout(() => {
             // Separate wildcard patterns from exact keys
-            const wildcardPatterns = clearKeys
-              .filter((key) => key.endsWith("*"))
-              .map((key) => key.slice(0, -1));
-            const exactKeys = clearKeys.filter((key) => !key.endsWith("*"));
+            const wildcardPatterns = clearKeys.filter((key) => key.includes("*"));
+            const exactKeys = clearKeys.filter((key) => !key.includes("*"));
 
             // Use single predicate call for all wildcard patterns
             if (wildcardPatterns.length > 0) {
@@ -141,7 +158,9 @@ export function ApiGetCall(props) {
                 predicate: (query) => {
                   if (!query.queryKey || !query.queryKey[0]) return false;
                   const queryKeyStr = String(query.queryKey[0]);
-                  return wildcardPatterns.some((pattern) => queryKeyStr.startsWith(pattern));
+                  return wildcardPatterns.some((pattern) =>
+                    matchesWildcardPattern(queryKeyStr, pattern),
+                  );
                 },
               });
             }
@@ -162,6 +181,7 @@ export function ApiGetCall(props) {
     keepPreviousData: keepPreviousData,
     refetchInterval: refetchInterval,
     retry: retryFn,
+    retryDelay: retryDelayWithRetryAfter,
   });
   return queryInfo;
 }
@@ -176,15 +196,17 @@ export function ApiPostCall({ relatedQueryKeys, onResult }) {
         const results = [];
         for (let i = 0; i < data.length; i++) {
           let element = data[i];
-          const response = await axios.post(url, element);
-          results.push(response);
+          const response = await axios.post(url, element, {
+            headers: await buildVersionedHeaders(),
+          });
+          results.push(response.data);
           if (onResult) {
             onResult(response.data); // Emit each result as it arrives
           }
         }
         return results;
       } else {
-        const response = await axios.post(url, data);
+        const response = await axios.post(url, data, { headers: await buildVersionedHeaders() });
         if (onResult) {
           onResult(response.data); // Emit each result as it arrives
         }
@@ -200,10 +222,8 @@ export function ApiPostCall({ relatedQueryKeys, onResult }) {
             queryClient.invalidateQueries();
           } else {
             // Separate wildcard patterns from exact keys
-            const wildcardPatterns = clearKeys
-              .filter((key) => key.endsWith("*"))
-              .map((key) => key.slice(0, -1));
-            const exactKeys = clearKeys.filter((key) => !key.endsWith("*"));
+            const wildcardPatterns = clearKeys.filter((key) => key.includes("*"));
+            const exactKeys = clearKeys.filter((key) => !key.includes("*"));
 
             // Use single predicate call for all wildcard patterns
             if (wildcardPatterns.length > 0) {
@@ -212,7 +232,7 @@ export function ApiPostCall({ relatedQueryKeys, onResult }) {
                   if (!query.queryKey || !query.queryKey[0]) return false;
                   const queryKeyStr = String(query.queryKey[0]);
                   const matches = wildcardPatterns.some((pattern) =>
-                    queryKeyStr.startsWith(pattern)
+                    matchesWildcardPattern(queryKeyStr, pattern),
                   );
 
                   // Debug logging for each query check
@@ -221,7 +241,7 @@ export function ApiPostCall({ relatedQueryKeys, onResult }) {
                       queryKey: query.queryKey,
                       queryKeyStr,
                       matchedPattern: wildcardPatterns.find((pattern) =>
-                        queryKeyStr.startsWith(pattern)
+                        matchesWildcardPattern(queryKeyStr, pattern),
                       ),
                     });
                   }
@@ -253,8 +273,9 @@ export function ApiGetCallWithPagination({
   waiting = true,
 }) {
   const dispatch = useDispatch();
+  const queryClient = useQueryClient();
   const MAX_RETRIES = retry;
-  const HTTP_STATUS_TO_NOT_RETRY = [401, 403, 404];
+  const HTTP_STATUS_TO_NOT_RETRY = [302, 401, 403, 404, 500];
 
   const retryFn = (failureCount, error) => {
     let returnRetry = true;
@@ -262,6 +283,12 @@ export function ApiGetCallWithPagination({
       returnRetry = false;
     }
     if (isAxiosError(error) && HTTP_STATUS_TO_NOT_RETRY.includes(error.response?.status ?? 0)) {
+      if (
+        error.response?.status === 302 &&
+        error.response?.headers.get("location").includes("/.auth/login/aad")
+      ) {
+        queryClient.invalidateQueries({ queryKey: ["authmecipp"] });
+      }
       returnRetry = false;
     }
 
@@ -271,7 +298,7 @@ export function ApiGetCallWithPagination({
           message: getCippError(error),
           title: "Error",
           toastError: error,
-        })
+        }),
       );
     }
     return returnRetry;
@@ -283,18 +310,18 @@ export function ApiGetCallWithPagination({
     queryFn: async ({ pageParam = null, signal }) => {
       const response = await axios.get(url, {
         signal: signal,
-        params: { ...data, ...pageParam },
-        headers: {
-          "Content-Type": "application/json",
-        },
+        params: { ...data, ...pageParam, ...impersonationCacheParams() },
+        headers: await buildVersionedHeaders(),
+        cippQueryKey: queryKey,
       });
       return response.data;
     },
     getNextPageParam: (lastPage) => {
+      // AllTenants pages only when the page opted into manualPagination.
       if (
         data?.noPagination ||
         data?.manualPagination === false ||
-        data?.tenantFilter === "AllTenants"
+        (data?.tenantFilter === "AllTenants" && data?.manualPagination !== true)
       ) {
         return undefined;
       }
@@ -303,6 +330,7 @@ export function ApiGetCallWithPagination({
     staleTime: 300000,
     refetchOnWindowFocus: false,
     retry: retryFn,
+    retryDelay: retryDelayWithRetryAfter,
   });
 
   return queryInfo;
